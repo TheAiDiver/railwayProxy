@@ -4,14 +4,14 @@ from typing import Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from starlette.responses import StreamingResponse
+from starlette.responses import StreamingResponse, HTMLResponse
 import secrets
 
 # Create FastAPI application
 app = FastAPI(title="Railway Security Proxy Service")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging - Set to DEBUG level for more detailed logs
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("proxy")
 
 # Set up security authentication
@@ -26,7 +26,8 @@ ALLOWED_IPS = [ip for ip in os.environ.get("ALLOWED_IPS", "").split(",") if ip]
 # Create HTTP client with timeout setting
 http_client = httpx.AsyncClient(
     base_url=f"http://{TARGET_SERVICE}",
-    timeout=30.0  # Add timeout to prevent hanging requests
+    timeout=30.0,
+    follow_redirects=True
 )
 
 async def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
@@ -76,18 +77,21 @@ async def proxy(
     body = await request.body()
     
     # Transform headers (exclude unnecessary headers)
-    excluded_headers = {"host", "authorization", "connection", "content-length"}
+    excluded_headers = {"host", "authorization", "connection", "content-length", "content-security-policy"}
     headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
     
-    # Add original client IP as X-Forwarded-For header
-    if "x-forwarded-for" not in {k.lower() for k in headers}:
-        headers["X-Forwarded-For"] = request.client.host
+    # Add important headers for proxy
+    headers["X-Forwarded-For"] = request.client.host
+    headers["X-Forwarded-Proto"] = request.url.scheme
+    headers["X-Forwarded-Host"] = request.headers.get("host", "")
     
     url = f"/{path}"
     method = request.method
     
     # Log request information
     logger.info(f"User '{credentials.username}' requested [{method}] {path}")
+    # Log request headers for debugging
+    logger.debug(f"Request headers: {headers}")
 
     try:
         # Forward request
@@ -96,28 +100,53 @@ async def proxy(
             url=url,
             content=body,
             headers=headers,
-            params=request.query_params,
-            follow_redirects=True
+            params=request.query_params
         )
         
         # Get all response headers
         response_headers = dict(response.headers)
         
-        # Handle response based on content type
-        content_type = response_headers.get("content-type", "")
+        # Remove or modify problematic headers
+        headers_to_remove = ["content-encoding", "content-security-policy", 
+                             "content-security-policy-report-only", "strict-transport-security"]
+        for header in headers_to_remove:
+            if header in response_headers:
+                del response_headers[header]
         
-        # Log response details for debugging
+        # Enable CORS headers
+        response_headers["Access-Control-Allow-Origin"] = "*"
+        response_headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        response_headers["Access-Control-Allow-Headers"] = "*"
+        
+        # Get content type
+        content_type = response_headers.get("content-type", "")
         logger.debug(f"Response status: {response.status_code}, Content-Type: {content_type}")
         
-        # Use streaming response for certain content types or large responses
-        if any(ct in content_type.lower() for ct in ["stream", "video", "audio"]) or response.status_code == 206:
-            return StreamingResponse(
-                response.aiter_bytes(),
+        # Log the first 200 characters of the response for debugging
+        if "text/html" in content_type:
+            logger.debug(f"HTML Response preview: {response.text[:200]}...")
+        
+        # Handle HTML responses - special handling for Next.js
+        if "text/html" in content_type.lower():
+            html_content = response.text
+            
+            # Return HTML response
+            return HTMLResponse(
+                content=html_content,
                 status_code=response.status_code,
                 headers=response_headers
             )
+            
+        # Use streaming response for large binary content
+        elif any(ct in content_type.lower() for ct in ["stream", "video", "audio", "application/", "image/"]) or response.status_code == 206:
+            return StreamingResponse(
+                response.aiter_bytes(),
+                status_code=response.status_code,
+                headers=response_headers,
+                media_type=content_type.split(";")[0] if ";" in content_type else content_type
+            )
         
-        # Use regular response for other cases
+        # Default response
         return Response(
             content=response.content,
             status_code=response.status_code,
