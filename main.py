@@ -1,7 +1,6 @@
-# main.py
 import os
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -24,8 +23,11 @@ AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "changeme")
 TARGET_SERVICE = os.environ.get("TARGET_SERVICE", "app.railway.internal")
 ALLOWED_IPS = [ip for ip in os.environ.get("ALLOWED_IPS", "").split(",") if ip]
 
-# Create HTTP client
-http_client = httpx.AsyncClient(base_url=f"http://{TARGET_SERVICE}")
+# Create HTTP client with timeout setting
+http_client = httpx.AsyncClient(
+    base_url=f"http://{TARGET_SERVICE}",
+    timeout=30.0  # Add timeout to prevent hanging requests
+)
 
 async def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)):
     """Verify user credentials"""
@@ -77,6 +79,10 @@ async def proxy(
     excluded_headers = {"host", "authorization", "connection", "content-length"}
     headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
     
+    # Add original client IP as X-Forwarded-For header
+    if "x-forwarded-for" not in {k.lower() for k in headers}:
+        headers["X-Forwarded-For"] = request.client.host
+    
     url = f"/{path}"
     method = request.method
     
@@ -94,14 +100,33 @@ async def proxy(
             follow_redirects=True
         )
         
-        # Create response
+        # Get all response headers
+        response_headers = dict(response.headers)
+        
+        # Handle response based on content type
+        content_type = response_headers.get("content-type", "")
+        
+        # Log response details for debugging
+        logger.debug(f"Response status: {response.status_code}, Content-Type: {content_type}")
+        
+        # Use streaming response for certain content types or large responses
+        if any(ct in content_type.lower() for ct in ["stream", "video", "audio"]) or response.status_code == 206:
+            return StreamingResponse(
+                response.aiter_bytes(),
+                status_code=response.status_code,
+                headers=response_headers
+            )
+        
+        # Use regular response for other cases
         return Response(
             content=response.content,
             status_code=response.status_code,
-            headers=dict(response.headers),
+            headers=response_headers,
+            media_type=content_type.split(";")[0] if ";" in content_type else content_type
         )
     except httpx.RequestError as exc:
         logger.error(f"Forward request error: {str(exc)}")
+        logger.error(f"Target URL: {TARGET_SERVICE}{url}")
         raise HTTPException(status_code=503, detail=f"Failed to request target service: {str(exc)}")
 
 @app.on_event("shutdown")
